@@ -26,6 +26,7 @@ import logo from "./iloader.svg";
 import { GlassCard } from "./components/GlassCard";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "./PlatformContext";
+import { InstallOptionsDialog } from "./components/InstallOptionsDialog";
 
 function App() {
   const { t } = useTranslation();
@@ -39,6 +40,9 @@ function App() {
     null | "certificates" | "appids" | "pairing"
   >(null);
   const [version, setVersion] = useState<string>("");
+  const [pendingIpaPath, setPendingIpaPath] = useState<string | null>(null);
+  const [isChoosingIpa, setIsChoosingIpa] = useState(false);
+  const choosingIpaRef = useRef(false);
 
   const refreshDevicesRef = useRef<(() => void) | null>(null);
 
@@ -146,6 +150,9 @@ function App() {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (pendingIpaPath !== null || operationState !== null || isChoosingIpa) {
+        return;
+      }
       if (event.key === undefined) return;
       const key = event.key.toLowerCase();
       const primaryPressed = platform === "mac" ? event.metaKey : event.ctrlKey;
@@ -171,7 +178,17 @@ function App() {
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [platform, ensureSelectedDevice, ensuredLoggedIn]);
+  }, [
+    platform,
+    ensureSelectedDevice,
+    ensuredLoggedIn,
+    pendingIpaPath,
+    operationState,
+    isChoosingIpa,
+  ]);
+
+  const installersDisabled =
+    operationState !== null || isChoosingIpa || pendingIpaPath !== null;
 
   return (
     <main className="workspace">
@@ -314,6 +331,7 @@ function App() {
             <GlassCard className="panel">
               <div className="action-row single-row">
                 <button
+                  disabled={installersDisabled}
                   onClick={() => {
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
                     startOperation(installSideStoreOperation, {
@@ -328,6 +346,7 @@ function App() {
                   {t("app.sidestore_stable")}
                 </button>
                 <button
+                  disabled={installersDisabled}
                   onClick={() => {
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
                     startOperation(installSideStoreOperation, {
@@ -342,6 +361,7 @@ function App() {
                   {t("app.sidestore_nightly")}
                 </button>
                 <button
+                  disabled={installersDisabled}
                   onClick={() => {
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
                     startOperation(installLiveContainerOperation, {
@@ -356,6 +376,7 @@ function App() {
                   {t("app.livecontainer_sidestore_stable")}
                 </button>
                 <button
+                  disabled={installersDisabled}
                   onClick={() => {
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
                     startOperation(installLiveContainerOperation, {
@@ -370,21 +391,27 @@ function App() {
                   {t("app.livecontainer_sidestore_nightly")}
                 </button>
                 <button
+                  disabled={installersDisabled}
                   onClick={async () => {
+                    if (choosingIpaRef.current || installersDisabled) return;
                     if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
-                    let path = await openFileDialog({
-                      multiple: false,
-                      filters: [
-                        { name: t("app.ipa_files"), extensions: ["ipa"] },
-                      ],
-                    });
-                    if (!path) return;
-                    startOperation(sideloadOperation, {
-                      appPath: path as string,
-                    }).catch((e) => {
-                      console.log(e.type);
-                      console.error(e.message);
-                    });
+                    choosingIpaRef.current = true;
+                    setIsChoosingIpa(true);
+                    try {
+                      const path = await openFileDialog({
+                        multiple: false,
+                        filters: [
+                          { name: t("app.ipa_files"), extensions: ["ipa"] },
+                        ],
+                      });
+                      if (typeof path === "string") setPendingIpaPath(path);
+                    } catch (error) {
+                      console.error("Failed to open IPA file dialog", error);
+                      toast.error(t("install_options.open_failed"));
+                    } finally {
+                      choosingIpaRef.current = false;
+                      setIsChoosingIpa(false);
+                    }
                   }}
                 >
                   {t("app.import_ipa")}
@@ -412,6 +439,21 @@ function App() {
           )}
         </section>
       </div>
+      {pendingIpaPath !== null && (
+        <InstallOptionsDialog
+          appPath={pendingIpaPath}
+          onCancel={() => setPendingIpaPath(null)}
+          onInstall={(bundleId) => {
+            const appPath = pendingIpaPath;
+            setPendingIpaPath(null);
+            if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
+            startOperation(sideloadOperation, { appPath, bundleId }).catch((e) => {
+              console.log(e.type);
+              console.error(e.message);
+            });
+          }}
+        />
+      )}
       <Modal
         isOpen={openModal === "certificates"}
         close={() => setOpenModal(null)}

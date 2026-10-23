@@ -370,3 +370,76 @@ h3,
 h4 {
   margin: 0.5rem 0;
 }
+
+.install-options {
+  width: min(440px, calc(95vw - 5rem));
+}
+
+.install-options h2 {
+  margin-top: 0;
+}
+
+.install-options-file {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.install-options-file span,
+.install-options-help {
+  color: #c4c4cc;
+  font-size: 0.9rem;
+}
+
+.install-options-file strong {
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+
+.install-options label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+}
+
+.install-options input {
+  width: 100%;
+}
+
+.install-options input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.install-options-help,
+.install-options-error {
+  margin: 0.6rem 0 0;
+}
+
+.install-options-error {
+  color: #ff8b83;
+  font-size: 0.9rem;
+}
+
+.install-options-note {
+  margin: 1.25rem 0;
+  font-size: 0.9rem;
+  color: #c4c4cc;
+}
+
+.install-options-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.install-options-actions button {
+  flex: 1;
+  min-width: 110px;
+}
+
+.install-options button:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 3px;
+}
