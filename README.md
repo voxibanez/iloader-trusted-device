@@ -42,6 +42,21 @@ The fork has separate settings and Keychain entries, so saved logins from the or
 
 The explicit **Reset anisette** action clears both legacy and current-Mac identities in the active storage backend for the next sign-in. Cancel any active sign-in before using it.
 
+## Choose a custom bundle ID (v2.4.1)
+
+1. Sign in, select your device, and click **Import IPA**.
+2. Select the IPA. The **Install IPA** dialog shows the selected filename.
+3. Optionally enter a **Custom bundle ID**, such as `com.example.myapp`.
+4. Click **Install**.
+
+An explicit custom ID becomes the final main app bundle ID exactly as entered after trimming surrounding whitespace; no developer-team suffix is added. Leave the field blank to retain iloader's default `original.bundle.id.TEAMID` behavior. The field resets for each installation.
+
+Custom IDs must contain at least two nonempty components separated by dots, using ASCII letters, numbers, or hyphens. Spaces, underscores, and wildcards are rejected before signing. Supported app extensions are renamed under the new main ID, and their registration and provisioning use the new IDs. The original IPA file is unchanged.
+
+Use the same bundle ID and Apple Account when updating an existing installation. A different ID identifies a separate app; changing it does not migrate existing app data. Apple can reject an ID that is unavailable to your team, and account/app-ID limits still apply. Custom IDs are rejected with a clear error for embedded Watch apps, App Clips, and nested app extensions that the existing signer does not register; leaving the field blank retains the standard installation behavior.
+
+Version 2.4.1 retains the trusted-device authentication implementation from the tested 2.4.0 fork and uses the same app identifier and credential storage.
+
 ## Build on an Apple Silicon Mac
 
 Prerequisites: Xcode Command Line Tools, [Rust/rustup](https://rustup.rs/), and [Bun](https://bun.sh/). The GitHub workflow pins Rust **1.99.1** and Bun **1.4.4**. The local script uses the versions installed on your Mac and records them in `build-info.txt`.
@@ -52,7 +67,7 @@ From the repository directory:
 bash scripts/build-trusted-device-macos.sh
 ```
 
-The script installs locked frontend dependencies, runs the vendored authentication library tests, builds the native app and DMG with locked Rust dependencies, verifies the app, and writes downloads to:
+The script installs locked frontend dependencies, runs the vendored library's authentication and bundle-ID tests, builds the native app and DMG with locked Rust dependencies, verifies the app, and writes downloads to:
 
 ```text
 src-tauri/target/trusted-device-artifacts/
@@ -68,7 +83,7 @@ bun run build
 cargo test --locked --manifest-path src-tauri/Cargo.toml -p isideload --lib
 ```
 
-The authentication tests use local fixture data and loopback HTTP responses. They do not authenticate to Apple, contact an anisette service, or need a real account. Linux may require the system development libraries used by isideload's dependencies; the macOS workflow is the supported app-build path.
+The tests use local IPA/plist fixtures and loopback HTTP responses. They do not authenticate to Apple, contact an anisette service, or need a real account. Linux may require the system development libraries used by isideload's dependencies; the macOS workflow is the supported app-build path.
 
 ## Source provenance and licensing
 
