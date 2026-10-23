@@ -1,6 +1,6 @@
 use futures::FutureExt;
 use isideload::{
-    anisette::remote_v3::RemoteV3AnisetteProvider,
+    anisette::remote_v3::{ANISETTE_MAC_STATE_KEY, ANISETTE_STATE_KEY, RemoteV3AnisetteProvider},
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
     dev::{
         app_ids::{AppIdsApi, ListAppIdsResponse},
@@ -139,28 +139,27 @@ pub fn invalidate_account(sideloader_state: State<'_, SideloaderMutex>) {
 }
 
 #[tauri::command]
-pub fn reset_anisette_state() -> Result<bool, AppError> {
-    let state_entry = Entry::new(KEYRING_SERVICE, "anisette_state").map_err(|e| {
-        AppError::KeyringWithMessage(
-            "Failed to create keyring entry for anisette".into(),
-            e.to_string(),
-        )
+pub fn reset_anisette_state(handle: AppHandle) -> Result<bool, AppError> {
+    let _login_guard = LOGIN_LOCK.try_lock().map_err(|_| {
+        AppError::Misc("Cancel the active sign-in before resetting anisette.".into())
     })?;
-
-    match state_entry.delete_credential() {
-        Ok(_) => {
-            debug!("Anisette state deleted from keyring.");
-            Ok(true)
+    let storage = create_sideloading_storage(&handle)?;
+    let mut deleted = false;
+    for key in [ANISETTE_STATE_KEY, ANISETTE_MAC_STATE_KEY] {
+        // Reset must also recover a malformed stored value. Deletion still
+        // reports access errors; missing or already-cleared entries are skipped.
+        let needs_reset = match storage.retrieve_data(key) {
+            Ok(None) => false,
+            Ok(Some(data)) => !data.is_empty(),
+            Err(_) => true,
+        };
+        if needs_reset {
+            storage.delete(key)?;
+            deleted = true;
         }
-        Err(keyring::Error::NoEntry) => {
-            debug!("No existing anisette state found in keyring, nothing to delete.");
-            Ok(false)
-        }
-        Err(e) => Err(AppError::KeyringWithMessage(
-            "Failed to delete anisette state".into(),
-            e.to_string(),
-        )),
     }
+    debug!("Reset anisette identities in the active storage backend");
+    Ok(deleted)
 }
 
 async fn login(
