@@ -246,8 +246,12 @@
         "Ensure your device is properly connected to your computer.",
         "Unplug and reconnect the device. If the issue persists, try a different USB port and cable."
       ],
-      "not_logged_in": ["Sign in to your Apple ID first."],
-      "no_device_selected": ["Select a device before continuing."],
+      "not_logged_in": [
+        "Sign in to your Apple ID first."
+      ],
+      "no_device_selected": [
+        "Select a device before continuing."
+      ],
       "anisette": [
         "Ensure your computer is connected to the internet.",
         "Change your anisette server. Try several different servers.",
@@ -283,5 +287,12 @@
     "updating": "Updating...",
     "downloaded_restarting": "Update downloaded! Restarting app...",
     "failed_download": "Failed to download update: {{error}}"
+  },
+  "fork": {
+    "subtitle": "Unofficial fork · Trusted-device 2FA",
+    "verification_title": "Trusted-device verification",
+    "verification_prompt": "Approve the Apple sign-in notification on an iPhone, iPad, or Mac signed in to this Apple Account, then enter the six-digit code. This build does not send SMS codes.",
+    "resend": "Send to devices again",
+    "last_error": "Apple could not verify that code: {{error}}"
   }
 }

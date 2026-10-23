@@ -1,155 +1,76 @@
-<a href="https://iloader.app">
-  <picture align="left" >
-    <source media="(prefers-color-scheme: dark)" srcset="/iloader.svg">
-    <img align="left" width="90" height="90" src="/iloader-dark.svg">
-  </picture>
-  
-  <div id="user-content-toc">
-    <ul style="list-style: none;">
-      <summary>
-        <h1>iloader</h1>
-      </summary>
-    </ul>
-  </div>
-</a>
+# iloader Trusted Device — unofficial fork
 
----
+A personal fork of [iloader](https://github.com/nab138/iloader) v2.4.0 that uses **trusted Apple devices for two-factor authentication** and disables the SMS route. It targets the `Failed to complete SMS 2FA` / HTTP 403 failure in isideload 0.5.0.
 
-[![Build iloader](https://img.shields.io/github/actions/workflow/status/nab138/iloader/build.yml?style=flat&logo=github&logoColor=white&label=Build%20iloader)](https://github.com/nab138/iloader/actions/workflows/build.yml) ![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fnab138%2F28258aff7e3f1d3a3084a21f4cff2e57%2Fraw%2Filoader_downloads.json&style=flat)
-[![Sponsor](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/nab138)
+This is an experimental, AI-assisted modification, not an official iloader release or an Apple authentication bypass. You still need the Apple Account password and a valid code from a trusted iPhone, iPad, or Mac signed in to that account. Apple may reject trusted-device authentication too; a successful build does not prove an account can sign in during an outage.
 
-Install SideStore (or other apps) and import your pairing file with ease
+## What changes
 
-**This repository and [iloader.app](https://iloader.app) are the only official ways to download iloader. There is also an unofficial [Homebrew cask](https://formulae.brew.sh/cask/iloader), an unofficial [AUR package](https://aur.archlinux.org/packages/iloader-bin), and an unofficial [Fedora COPR repository](https://copr.fedorainfracloud.org/coprs/anudeepd/iloader) maintained by the community. Do not download from any other sources or websites.**
+- Apple responses that normally select SMS (`secondaryAuth`) request a trusted-device challenge instead. A pending HTTP 409 challenge also requests a fresh device challenge.
+- Legacy SMS-send, SMS-verify, and unknown-method states are redirected before dispatch. SMS callbacks are rejected, SMS implementation code is removed, and the SMS HTTP builders fail before constructing a request.
+- A rejected trusted-device challenge stops with its HTTP status. An invalid code stays unverified and can be corrected. A successful verification must still complete the normal Apple login.
+- The dialog shows verification errors and offers **Send to devices again** and **Cancel**. Three device-code requests per sign-in and the existing fifteen-transition limit bound retries.
+- Only one login can own the verification dialog at a time. The response listener is installed before the prompt and removed on completion or timeout.
+- Upstream auto-updates are removed. The app uses a separate identifier (`com.voxibanez.iloader.trusted-device`) and Keychain service (`iloader-trusted-device`), so it starts with its own settings and saved credentials.
 
-<img width="1918" height="998" alt="iloader0" src="https://github.com/user-attachments/assets/93cd135d-6d89-46ee-9b9f-12c596806911" />
+This does not change the Apple Account's security settings, trusted phone numbers, app-signing limits, anisette providers, or Apple-side availability.
 
-## How to use
+## Download the Mac build
 
-- Install usbmuxd for your platform
-  - Windows: [iTunes](https://apple.co/ms)
-  - macOS: Included
-  - Linux: Potentially included, if not, install via your package manager
-- Install the latest version for your platform from the [releases](https://github.com/nab138/iloader/releases)
-  - NixOS: Use the flake `github:nab138/iloader`
-  - Fedora: Use the .RPM or the unofficial [Fedora COPR repository](https://copr.fedorainfracloud.org/coprs/anudeepd/iloader)
-  - Arch: Use the unofficial [AUR package](https://aur.archlinux.org/packages/iloader-bin),
-- Plug in your iDevice to your computer
-- Open the app
-- Sign into your Apple ID
-- Select your action (e.g. install SideStore)
+In this repository's **Actions** tab, open a successful **Build trusted-device macOS app** run and download the `iloader-trusted-device-macos-arm64` artifact. It contains:
 
-## Features
+- `iloader-trusted-device-macos-arm64.dmg`
+- `iloader-trusted-device-macos-arm64.app.zip`
+- `SHA256SUMS`
+- `build-info.txt` with the source commit and toolchain
 
-- Install SideStore (or LiveContainer + SideStore), import certificate and place rppairing+lockdown pairing files automatically
-- Import any IPA
-- Intelligent error suggestions to help resolve common issues
-- Manage pairing files in apps like StikDebug, SideStore, Protokolle, etc
-- See and revoke development certificates & app ids
+The app targets **Apple Silicon (arm64)**. It is **ad-hoc signed and not notarized**. No Apple Account credentials or Apple signing secrets are used to build it. The workflow verifies the signature structure and the executable architecture; ad-hoc signing does not confer Apple notarization or developer identity.
 
-## Troubleshooting
+Open the DMG and copy **iloader Trusted Device** to Applications, or extract the app ZIP. If macOS asks you to approve the app, use the normal **System Settings → Privacy & Security → Open Anyway** flow after reviewing the source and checksum. Do not disable Gatekeeper globally.
 
-- If you are unable to solve an issue on your own, copy the full error message and ask on the [idevice Discord server](https://discord.gg/EA6yVgydBz) or [open an issue](https://github.com/nab138/iloader/issues).
-- You can view app logs with the "View Logs." If nothing is showing up, change the log level to "Debug."
-- If those logs aren't helpful, logs with additional are stored in the following locations:
-  - Windows: `%APPDATA%\me.nabdev.iloader\logs`
-  - macOS: `~/Library/Application Support/me.nabdev.iloader/logs`
-  - Linux: `~/.local/share/me.nabdev.iloader/logs/`
+## Sign in and test
 
-## Translating
+1. Open **iloader Trusted Device**. Its subtitle identifies it as an unofficial trusted-device fork.
+2. Sign in using the Apple Account already signed in to your trusted iPhone, iPad, or Mac.
+3. Approve Apple's sign-in notification on that device and enter its six-digit code in the app.
+4. If no code arrives, try **Send to devices again**. If Apple rejects the request, preserve the error text; there is no SMS fallback.
+5. After login succeeds, connect/trust your iPhone and use the normal IPA or SideStore installation action.
 
-iloader needs localization! If you speak another language and notice iloader does not support it or has mistakes, please consider contributing.
+The fork has separate settings and Keychain entries, so saved logins from the original app will not appear automatically. You can keep both apps installed. Do not share account passwords, verification codes, pairing files, or full authentication logs in public issues.
 
-To update/edit an existing language, make a PR modifying `src/locales/<lang>.json`.
+## Build on an Apple Silicon Mac
 
-To add a new language, add your language to `src/i18next.ts`, and in `src/locales` copy `en.json` to a new file titled `<langcode>.json` and update the strings.
+Prerequisites: Xcode Command Line Tools, [Rust/rustup](https://rustup.rs/), and [Bun](https://bun.sh/). The GitHub workflow pins Rust **1.99.1** and Bun **1.4.4**. The local script uses the versions installed on your Mac and records them in `build-info.txt`.
 
-**i18next.ts:**
+From the repository directory:
 
-```ts
-const languages = [
-  ["en", "English"],
-  ["es", "Español"],
-  // Your language here...
-] as const;
+```bash
+bash scripts/build-trusted-device-macos.sh
 ```
 
-You can also add your name to the translators section of the README.
+The script installs locked frontend dependencies, runs the vendored authentication library tests, builds the native app and DMG with locked Rust dependencies, verifies the app, and writes downloads to:
 
-Thank you for translating!
+```text
+src-tauri/target/trusted-device-artifacts/
+```
 
-## Building from source
+The macOS build requires the macOS SDK and an Apple Silicon host. It cannot be built by this script in a Linux container.
 
-1. Install [bun](https://bun.sh) (or [Node.js](https://nodejs.org)) and [Rust](https://www.rust-lang.org/tools/install)
-2. Clone the repository and `cd` into it
-3. Run `bun i` (or `npm i`)
+## Development checks
 
-For development with hot reload: `bun tauri dev` (or `npm run tauri dev`)
-Make a production build: `bun tauri build` (or `npm run tauri build`)
+```bash
+bun install --frozen-lockfile
+bun run build
+cargo test --locked --manifest-path src-tauri/Cargo.toml -p isideload --lib
+```
 
-## Credits
+The authentication tests use local fixture data and loopback HTTP responses. They do not authenticate to Apple, contact an anisette service, or need a real account. Linux may require the system development libraries used by isideload's dependencies; the macOS workflow is the supported app-build path.
 
-- Icon made by [Transistor](https://github.com/transistor-exe)
-- UI improved by [StephenDev0](https://github.com/StephenDev0)
-- [idevice](https://github.com/jkcoxson/idevice) by [jkcoxson](https://github.com/jkcoxson) for communicating with iOS devices
-- [isideload](https://github.com/nab138/isideload) for installing apps
-  - [idevice](https://github.com/jkcoxson/idevice) by [jkcoxson](https://github.com/jkcoxson) crate is used to communicate with the device
-  - [apple-codesign-quick](https://github.com/Dadoum/apple-codesign-quick) by [Dadoum](https://github.com/Dadoum) for codesigning and entitlements
-  - [Impactor](https://github.com/claration/Impactor) by [claration](https://github.com/claration) was used as a reference for cryptography operations (converting certs to p12, etc.).
-  - [Sideloader](https://github.com/Dadoum/Sideloader) by [Dadoum](https://github.com/Dadoum) was used as a reference for how apple private developer endpoints work
-- [idevice_pair](https://github.com/jkcoxson/idevice_pair) was used as a reference for pairing file management
-- App made with [tauri](https://tauri.app)
+## Source provenance and licensing
 
-## Translators
+- iloader v2.4.0: commit `902597564315442f00ab299dcc758ee0e13b8fa8` from [nab138/iloader](https://github.com/nab138/iloader/tree/v2.4.0).
+- Vendored isideload 0.5.0: [published crate](https://crates.io/crates/isideload/0.5.0), source commit `fc7a81a6de678aa707e05399ffafb8be0ad56921`.
+- Original crate archive SHA-256: `649ccce64715f7b8f1e9eb330defc48d06d5d35eb8d13d17783533b02c67ba32`.
+- The application depends directly on `vendor/isideload`; a registry update cannot silently replace the authentication patch.
 
-Thank you to everyone who has contributed translations! See the [Translating](#translating) section if you would like to contribute as well.
-
-- [By3lish](https://github.com/by3lish): Azerbaijani (az)
-- [TNT-333](https://github.com/TNT-333): German (de)
-- [basketshoe](https://github.com/basketshoe): Italian (it)
-- [baocreata](https://github.com/baocreata): Vietnamese (vt)
-- [IamArayel](https://github.com/IamArayel): French (fr)
-- [kkula9999](https://github.com/kkula9999): Traditional & Simplified Chinese (zh_tw & zh_cn)
-- [sibwaze](https://github.com/sibwaze): Russian (ru)
-- [notmalicik](https://github.com/notmalicik): Română (ro)
-- [mirdukkkkk](https://github.com/mirdukkkkk): Improved Russian (ru)
-- [okinaau](https://github.com/okinaau): Arabic (ar)
-- [ChouChiu](https://github.com/ChouChiu): Cantonese (zh_hk) & Improved Chinese (zh_tw & zh_cn)
-- [marcinmajsc](https://github.com/marcinmajsc): Polish (pl)
-- [ern775](https://github.com/ern775): Turkish (tr)
-- [canpng](https://github.com/canpng): Improved Turkish (tr)
-- [jazoppix](https://github.com/jazoppix): Spanish (es)
-- [eseiker](https://github.com/eseiker): Korean (ko)
-- [seomin0610](https://github.com/seomin0610): Improved Korean (ko)
-- [Ordyan777](https://github.com/Ordyan777): Armenian (am)
-- [kakik0u](https://github.com/kakik0u): Japanese (ja)
-- [lkspodmol](https://github.com/lkspodmol): Czech (cs_cz)
-- [marcusherelammonstyle-cmd](https://github.com/marcusherelammonstyle-cmd): Swedish (sv)
-- [MCI49312](https://github.com/MCI49312): Hungarian (hu)
-- [Kynonim](https://github.com/Kynonim): Indonesian (id)
-- [DD00031](https://github.com/DD00031): Dutch (nl)
-- [Toritan123](https://github.com/Toritan123): Improved Japanese (ja)
-- [marcinmajsc](https://github.com/marcinmajsc): Improved Polish (pl)
-- [dleiferives](https://github.com/dleiferives): Greek (el)
-- [ShadowWLX](https://github.com/ShadowWLX): Improved French (fr)
-- [fkpcomposer](https://github.com/fkpcomposer): Brazilian Portuguese (pt_br)
-- [474FrediFred](https://github.com/474FrediFred): Swiss German (de_ch)
-- [bovae](https://github.com/bovae) & [b1twalker](https://github.com/b1twalker): Ukranian (uk)
-
-## License
-
-Copyright (C) 2026 nab138
-
-The source code of this repository is licensed under the MIT License. See the [LICENSE](/LICENSE) file for the full text.
-
-Branding, logos, media assets, and the name “iloader” are not licensed under the MIT License and are subject to separate restrictions.
-
-You may retain or use branding materials in forks, tutorials, or documentation if you include a clear link to either the official site (https://iloader.app) or the iloader source code repository (https://github.com/nab138/iloader) and do not imply official endorsement. See [LICENSE-BRANDING](/LICENSE-BRANDING) for full details.
-
-## Contributing
-
-Please read our [Contributing](/CONTRIBUTING.md) policy before making a contribution.
-
-## Future Plans
-
-iloader is currently being overhauled, see the [trello board](https://trello.com/b/hAe1LHTj/iloader) for more info!
+Original authors retain their copyrights. The source is MIT-licensed; see `LICENSE` and `vendor/isideload/LICENSE`. Branding is governed by `LICENSE-BRANDING`. Original iloader branding is used with attribution to [the official project](https://github.com/nab138/iloader); this fork is not affiliated with or endorsed by its maintainer. The app's GitHub button continues to link to the official project.

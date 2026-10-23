@@ -25,9 +25,12 @@ use tracing::debug;
 
 use crate::{
     error::AppError,
-    secure_storage::create_sideloading_storage,
+    secure_storage::{KEYRING_SERVICE, create_sideloading_storage},
     sideload::{SideloaderGuard, SideloaderMutex},
 };
+
+// All windows share the response event, so only one sign-in may own it at a time.
+static LOGIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tauri::command]
 pub async fn login_new(
@@ -44,7 +47,7 @@ pub async fn login_new(
     *sideloader_guard = Some(account);
 
     if save_credentials {
-        let pass_entry = Entry::new("iloader", &email).map_err(|e| {
+        let pass_entry = Entry::new(KEYRING_SERVICE, &email).map_err(|e| {
             AppError::KeyringWithMessage(
                 "Failed to create entry for credentials".into(),
                 e.to_string(),
@@ -79,7 +82,7 @@ pub async fn login_stored(
     anisette_server: String,
     sideloader_state: State<'_, SideloaderMutex>,
 ) -> Result<(), AppError> {
-    let pass_entry = Entry::new("iloader", &email).map_err(|e| {
+    let pass_entry = Entry::new(KEYRING_SERVICE, &email).map_err(|e| {
         AppError::KeyringWithMessage(
             "Failed to create keyring entry for credentials".to_string(),
             e.to_string(),
@@ -108,7 +111,7 @@ pub fn delete_account(handle: AppHandle, email: String) -> Result<(), AppError> 
         .unwrap_or_else(std::vec::Vec::new);
     existing_ids.retain(|v| v.as_str().is_none_or(|s| s != email));
     store.set("ids", Value::Array(existing_ids));
-    let pass_entry = Entry::new("iloader", &email).map_err(|e| {
+    let pass_entry = Entry::new(KEYRING_SERVICE, &email).map_err(|e| {
         AppError::KeyringWithMessage(
             "Failed to create keyring entry for credentials".into(),
             e.to_string(),
@@ -136,7 +139,7 @@ pub fn invalidate_account(sideloader_state: State<'_, SideloaderMutex>) {
 
 #[tauri::command]
 pub fn reset_anisette_state() -> Result<bool, AppError> {
-    let state_entry = Entry::new("iloader", "anisette_state").map_err(|e| {
+    let state_entry = Entry::new(KEYRING_SERVICE, "anisette_state").map_err(|e| {
         AppError::KeyringWithMessage(
             "Failed to create keyring entry for anisette".into(),
             e.to_string(),
@@ -166,27 +169,52 @@ async fn login(
     password: &str,
     anisette_server: String,
 ) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+    let _login_guard = LOGIN_LOCK.try_lock().map_err(|_| {
+        AppError::Misc("A sign-in is already in progress. Complete or cancel it first.".into())
+    })?;
     let tfa_closure = {
         let window_clone = window.clone();
         move |params: TwoFactorCallbackParams| {
             let window_clone = window_clone.clone();
 
             async move {
-                window_clone
-                    .emit("2fa-required", params)
-                    .context("Failed to emit 2fa-required event")?;
+                if params.sms || params.unknown {
+                    bail!("This build only supports trusted-device verification");
+                }
 
-                let (tx, rx) = std::sync::mpsc::channel::<String>();
-                let handler_id = window_clone.listen("2fa-recieved", move |event| {
-                    let code = event.payload();
-                    let _ = tx.send(code.to_string());
+                // Register before displaying the dialog so a fast response cannot be lost.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+                let handler_id = window_clone.listen("2fa-response", move |event| {
+                    let _ = tx.try_send(event.payload().to_owned());
                 });
 
-                let result = rx.recv_timeout(Duration::from_secs(120))?;
-                window_clone.unlisten(handler_id);
+                if let Err(error) = window_clone.emit("2fa-required", params) {
+                    window_clone.unlisten(handler_id);
+                    return Err(report!(error)
+                        .context("Failed to emit 2fa-required event")
+                        .into());
+                }
 
-                let code = result.trim_matches('"').to_string();
-                Ok(TwoFactorCallbackResponse::SubmitCode(code))
+                let result = tokio::time::timeout(Duration::from_secs(300), rx.recv()).await;
+                window_clone.unlisten(handler_id);
+                let _ = window_clone.emit("2fa-finished", ());
+
+                let payload = result
+                    .context("Timed out waiting for a trusted-device verification code")?
+                    .context("Trusted-device verification dialog closed")?;
+                let response: TwoFactorCallbackResponse = serde_json::from_str(&payload)
+                    .context("Invalid trusted-device verification response")?;
+                match response {
+                    TwoFactorCallbackResponse::SubmitCode(ref code)
+                        if code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) =>
+                    {
+                        Ok(response)
+                    }
+                    TwoFactorCallbackResponse::ResendCode | TwoFactorCallbackResponse::Abort => {
+                        Ok(response)
+                    }
+                    _ => bail!("Expected a six-digit trusted-device code, resend, or cancel"),
+                }
             }
             .boxed()
         }
