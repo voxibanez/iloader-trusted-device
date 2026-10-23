@@ -14,6 +14,7 @@ use reqwest_middleware::ClientBuilder as MwClientBuilder;
 use rootcause::option_ext::OptionExt;
 use rootcause::prelude::*;
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 
 use crate::anisette::remote_v3::websocket::AppWebSocket;
@@ -28,6 +29,45 @@ use crate::util::storage::{SideloadingStorage, new_storage};
 
 pub const DEFAULT_ANISETTE_V3_URL: &str = "https://ani.jkcoxson.com";
 pub const ANISETTE_STATE_KEY: &str = "anisette_state";
+// A separate key makes the current-Mac transition provision once without
+// deleting the identity used by earlier builds. Subsequent sign-ins reuse it.
+pub const ANISETTE_MAC_STATE_KEY: &str = "anisette_state_current_mac_v1";
+
+// AnisetteKit defaults, also used by SideInstaller 1.6.1's 2026-10-23 fix:
+// https://github.com/mahee96/AnisetteKit/blob/db8b41022697b6c19be8a5f01a1ce834145a2a26/Sources/Constants.swift
+const CURRENT_MAC_CLIENT_INFO: &str =
+    "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+const CURRENT_MAC_USER_AGENT: &str = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)";
+
+fn mac_version(client: &str) -> Option<(u32, u32)> {
+    let rest = ["<macOS;", "<Mac OS X;"]
+        .iter()
+        .find_map(|marker| client.split_once(marker).map(|(_, rest)| rest))?;
+    let version = rest.split([';', '>']).next()?.trim();
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+fn effective_client_info(advertised: AnisetteClientInfo) -> AnisetteClientInfo {
+    if mac_version(&advertised.client_info).is_some_and(|version| version < (10, 13)) {
+        info!("Using current Mac authentication identity for a legacy Mac anisette server");
+        return AnisetteClientInfo {
+            client_info: CURRENT_MAC_CLIENT_INFO.to_string(),
+            user_agent: CURRENT_MAC_USER_AGENT.to_string(),
+        };
+    }
+    advertised
+}
+
+fn state_key_for(client_info: &AnisetteClientInfo) -> &'static str {
+    if mac_version(&client_info.client_info).is_some_and(|version| version >= (10, 13)) {
+        ANISETTE_MAC_STATE_KEY
+    } else {
+        ANISETTE_STATE_KEY
+    }
+}
 
 pub struct RemoteV3AnisetteProvider {
     pub state: Option<AnisetteState>,
@@ -36,6 +76,7 @@ pub struct RemoteV3AnisetteProvider {
     serial_number: String,
     client: reqwest_middleware::ClientWithMiddleware,
     websocket_proxy: Option<String>,
+    client_info: OnceCell<AnisetteClientInfo>,
 }
 
 impl RemoteV3AnisetteProvider {
@@ -57,6 +98,7 @@ impl RemoteV3AnisetteProvider {
             serial_number,
             client: Self::build_reqwest_client(None)?,
             websocket_proxy: None,
+            client_info: OnceCell::new(),
         })
     }
 
@@ -94,11 +136,14 @@ impl RemoteV3AnisetteProvider {
 
     pub fn set_url(mut self, url: &str) -> RemoteV3AnisetteProvider {
         self.url = url.to_string();
+        self.client_info = OnceCell::new();
+        self.state = None;
         self
     }
 
     pub fn set_storage(mut self, storage: Box<dyn SideloadingStorage>) -> RemoteV3AnisetteProvider {
         self.storage = storage;
+        self.state = None;
         self
     }
 
@@ -119,27 +164,27 @@ impl AnisetteProvider for RemoteV3AnisetteProvider {
         self.fetch_headers(Some(sim)).await
     }
 
-    // Can be hardcoded, but apple is changing things so much nowadays it makes more sense to just get it from the server
+    // Cache the effective profile for this provider. Provisioning, SRP, and
+    // verification must not change identities if server metadata changes.
     async fn get_client_info(&self) -> Result<AnisetteClientInfo, Report> {
         let info = self
-            .client
-            .get(format!("{}/v3/client_info", self.url))
-            .send()
-            .await
-            .context("Failed to request /v3/client_info from anisette server")?
-            .error_for_status()
-            .context("anisette server returned an error for /v3/client_info")?
-            .json::<AnisetteClientInfo>()
-            .await
-            .context("Failed to parse /v3/client_info response")?;
-
-        // let info = AnisetteClientInfo {
-        //     client_info:
-        //         "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        //             .to_string(),
-        //     user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
-        // };
-        Ok(info)
+            .client_info
+            .get_or_try_init(|| async {
+                let advertised = self
+                    .client
+                    .get(format!("{}/v3/client_info", self.url))
+                    .send()
+                    .await
+                    .context("Failed to request /v3/client_info from anisette server")?
+                    .error_for_status()
+                    .context("anisette server returned an error for /v3/client_info")?
+                    .json::<AnisetteClientInfo>()
+                    .await
+                    .context("Failed to parse /v3/client_info response")?;
+                Ok::<_, Report>(effective_client_info(advertised))
+            })
+            .await?;
+        Ok(info.clone())
     }
 
     async fn provision(&mut self, gs: &Arc<GrandSlam>, force_reset: bool) -> Result<(), Report> {
@@ -211,11 +256,12 @@ impl RemoteV3AnisetteProvider {
         gs: &Arc<GrandSlam>,
         force_reset: bool,
     ) -> Result<&mut AnisetteState, Report> {
+        let state_key = state_key_for(&gs.client_info);
         if force_reset {
             warn!("Resetting anisette state");
             self.state = Some(AnisetteState::new());
         } else if self.state.is_none() {
-            if let Ok(Some(state)) = &self.storage.retrieve_data(ANISETTE_STATE_KEY) {
+            if let Ok(Some(state)) = &self.storage.retrieve_data(state_key) {
                 if let Ok(state) = plist::from_bytes(state) {
                     info!("Loaded existing anisette state");
                     self.state = Some(state);
@@ -224,7 +270,7 @@ impl RemoteV3AnisetteProvider {
                     self.state = Some(AnisetteState::new());
                 }
             } else {
-                info!("No existing anisette state found");
+                info!("No existing anisette state found for this client profile");
                 self.state = Some(AnisetteState::new());
             }
         }
@@ -239,8 +285,7 @@ impl RemoteV3AnisetteProvider {
         let buf = Vec::new();
         let mut writer = std::io::BufWriter::new(buf);
         plist::to_writer_xml(&mut writer, &state)?;
-        self.storage
-            .store_data(ANISETTE_STATE_KEY, &writer.into_inner()?)?;
+        self.storage.store_data(state_key, &writer.into_inner()?)?;
 
         Ok(state)
     }
@@ -444,4 +489,242 @@ enum AnisetteHeaders {
         #[serde(rename = "X-Apple-I-MD-RINFO")]
         routing_info: String,
     },
+}
+
+#[cfg(all(test, not(feature = "wasm")))]
+mod current_mac_tests {
+    use super::*;
+    use crate::util::storage::InMemoryStorage;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const OLD_MAC: &str =
+        "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+
+    #[derive(Clone, Default)]
+    struct SharedStorage(Arc<InMemoryStorage>);
+
+    impl SideloadingStorage for SharedStorage {
+        fn store(&self, key: &str, value: &str) -> Result<(), Report> {
+            self.0.store(key, value)
+        }
+
+        fn retrieve(&self, key: &str) -> Result<Option<String>, Report> {
+            self.0.retrieve(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report> {
+            self.0.delete(key)
+        }
+    }
+
+    fn profile(client_info: &str, user_agent: &str) -> AnisetteClientInfo {
+        AnisetteClientInfo {
+            client_info: client_info.into(),
+            user_agent: user_agent.into(),
+        }
+    }
+
+    fn provider(url: &str, storage: SharedStorage) -> RemoteV3AnisetteProvider {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut provider =
+            RemoteV3AnisetteProvider::new(url, Box::new(storage), "0".into()).unwrap();
+        provider.client = MwClientBuilder::new(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        )
+        .build();
+        provider
+    }
+
+    fn provisioned_fixture() -> AnisetteState {
+        AnisetteState {
+            keychain_identifier: [17; 16],
+            adi_pb: Some(vec![1, 2, 3]),
+        }
+    }
+
+    #[test]
+    fn legacy_mac_metadata_gets_current_mac_identity_and_separate_storage() {
+        for old in [OLD_MAC, "<MacBookPro11,1> <macOS;10.9.5;13F1911> <akd>"] {
+            let actual = effective_client_info(profile(old, "old-user-agent"));
+            assert_eq!(actual.client_info, CURRENT_MAC_CLIENT_INFO);
+            assert_eq!(actual.user_agent, CURRENT_MAC_USER_AGENT);
+            assert_eq!(state_key_for(&actual), ANISETTE_MAC_STATE_KEY);
+        }
+    }
+
+    #[test]
+    fn modern_and_non_mac_server_metadata_remains_unchanged() {
+        for (client, key) in [
+            (
+                "<MacBookPro14,1> <Mac OS X;10.13.6;17G66> <akd>",
+                ANISETTE_MAC_STATE_KEY,
+            ),
+            ("<Mac14,2> <macOS;15;24A335> <akd>", ANISETTE_MAC_STATE_KEY),
+            ("<PC> <Windows;6.2(0,0);9200> <iTunes>", ANISETTE_STATE_KEY),
+            ("<Pixel 7> <Android;14;UQ1A> <akd>", ANISETTE_STATE_KEY),
+            ("<Mac> <macOS;unknown;build> <akd>", ANISETTE_STATE_KEY),
+        ] {
+            let actual = effective_client_info(profile(client, "server-user-agent"));
+            assert_eq!(actual.client_info, client);
+            assert_eq!(actual.user_agent, "server-user-agent");
+            assert_eq!(state_key_for(&actual), key);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_is_fetched_once_and_survives_the_server_closing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = serde_json::json!({
+            "client_info": OLD_MAC,
+            "user_agent": "old-user-agent"
+        })
+        .to_string();
+        // Serve exactly one request, then drop the listener. A second fetch
+        // (including a concurrent cache miss) cannot accidentally succeed.
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "metadata request did not arrive");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("metadata mock accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0 && request.len() < 8192, "invalid mock request");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            drop(stream);
+            String::from_utf8(request).unwrap()
+        });
+        let provider = provider(&url, SharedStorage::default());
+        let (first, simultaneous) =
+            tokio::join!(provider.get_client_info(), provider.get_client_info());
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /v3/client_info HTTP/1.1\r\n"));
+        for actual in [
+            first.unwrap(),
+            simultaneous.unwrap(),
+            provider.get_client_info().await.unwrap(),
+        ] {
+            assert_eq!(actual.client_info, CURRENT_MAC_CLIENT_INFO);
+            assert_eq!(actual.user_agent, CURRENT_MAC_USER_AGENT);
+        }
+    }
+
+    #[tokio::test]
+    async fn current_mac_migration_preserves_legacy_and_reuses_new_identity() {
+        let storage = SharedStorage::default();
+        let mut legacy_bytes = Vec::new();
+        plist::to_writer_xml(&mut legacy_bytes, &provisioned_fixture()).unwrap();
+        storage
+            .store_data(ANISETTE_STATE_KEY, &legacy_bytes)
+            .unwrap();
+        let mut first = provider("http://127.0.0.1:1", storage.clone());
+        let mut gs = GrandSlam::for_auth_test(plist::Dictionary::new());
+        gs.client_info = profile(CURRENT_MAC_CLIENT_INFO, CURRENT_MAC_USER_AGENT);
+        let gs = Arc::new(gs);
+
+        // An empty URL bag fails before provisioning can touch the network.
+        // Success here would mean the already-provisioned legacy state leaked in.
+        let error = first.get_state(&gs, false).await.unwrap_err();
+        assert!(format!("{error:?}").contains("URL bag"));
+        assert!(first.state.as_ref().unwrap().adi_pb.is_none());
+        assert_eq!(
+            storage.retrieve_data(ANISETTE_STATE_KEY).unwrap(),
+            Some(legacy_bytes.clone())
+        );
+        assert!(
+            storage
+                .retrieve_data(ANISETTE_MAC_STATE_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        // Simulate successful provisioning, then exercise the real persistence
+        // path. A fresh provider must reuse it without needing a URL bag.
+        first.state.as_mut().unwrap().adi_pb = Some(vec![4, 5, 6]);
+        let identifier = first
+            .get_state(&gs, false)
+            .await
+            .unwrap()
+            .keychain_identifier;
+        let stored = storage
+            .retrieve_data(ANISETTE_MAC_STATE_KEY)
+            .unwrap()
+            .unwrap();
+        let saved: AnisetteState = plist::from_bytes(&stored).unwrap();
+        assert_eq!(saved.keychain_identifier, identifier);
+        assert_eq!(saved.adi_pb, Some(vec![4, 5, 6]));
+        drop(first);
+
+        let mut next = provider("http://127.0.0.1:1", storage.clone());
+        let reused = next.get_state(&gs, false).await.unwrap();
+        assert_eq!(reused.keychain_identifier, identifier);
+        assert_eq!(reused.adi_pb, Some(vec![4, 5, 6]));
+        assert_eq!(
+            storage.retrieve_data(ANISETTE_STATE_KEY).unwrap(),
+            Some(legacy_bytes)
+        );
+        assert_eq!(
+            storage.retrieve_data(ANISETTE_MAC_STATE_KEY).unwrap(),
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn changing_url_or_storage_discards_state_from_the_previous_configuration() {
+        let mut configured = provider("http://127.0.0.1:1", SharedStorage::default());
+        configured
+            .client_info
+            .set(profile(CURRENT_MAC_CLIENT_INFO, CURRENT_MAC_USER_AGENT))
+            .unwrap();
+        configured.state = Some(provisioned_fixture());
+        let mut changed = configured.set_url("http://127.0.0.1:2");
+        assert_eq!(changed.url, "http://127.0.0.1:2");
+        assert!(changed.client_info.get().is_none());
+        assert!(changed.state.is_none());
+
+        changed
+            .client_info
+            .set(profile(CURRENT_MAC_CLIENT_INFO, CURRENT_MAC_USER_AGENT))
+            .unwrap();
+        changed.state = Some(provisioned_fixture());
+        let replacement = SharedStorage::default();
+        replacement.store("backend", "replacement").unwrap();
+        let changed = changed.set_storage(Box::new(replacement));
+        assert!(changed.state.is_none());
+        assert_eq!(
+            changed.client_info.get().unwrap().client_info,
+            CURRENT_MAC_CLIENT_INFO
+        );
+        assert_eq!(
+            changed.storage.retrieve("backend").unwrap().as_deref(),
+            Some("replacement")
+        );
+    }
 }
