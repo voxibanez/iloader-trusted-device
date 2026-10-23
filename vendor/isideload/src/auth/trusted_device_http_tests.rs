@@ -70,6 +70,9 @@ impl MockServer {
                         Err(error) => panic!("mock HTTP accept: {error}"),
                     }
                 };
+                // Accepted sockets inherit nonblocking mode on macOS. The
+                // fixture's worker uses bounded, blocking request reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -134,7 +137,10 @@ impl Drop for MockServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
+            let result = worker.join();
+            if !thread::panicking() {
+                result.unwrap();
+            }
         }
     }
 }
