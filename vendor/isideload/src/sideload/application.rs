@@ -7,6 +7,7 @@ use crate::dev::developer_session::DeveloperSession;
 use crate::dev::teams::DeveloperTeam;
 use crate::sideload::builder::ExtensionsBehavior;
 use crate::sideload::bundle::Bundle;
+use crate::sideload::bundle_id::{normalize_bundle_id, remap_identifier};
 use crate::sideload::cert_identity::CertificateIdentity;
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -164,27 +165,113 @@ impl Application {
         main_app_bundle_id: &str,
         main_app_id_str: &str,
     ) -> Result<(), Report> {
-        let extensions = self.bundle.app_extensions_mut();
-        for ext in extensions.iter_mut() {
-            if let Some(id) = ext.bundle_identifier() {
-                if !(id.starts_with(main_app_bundle_id) && id.len() > main_app_bundle_id.len()) {
+        // Check every extension first, so a malformed later extension cannot
+        // leave the in-memory application only partly renamed.
+        let extension_ids = self
+            .bundle
+            .app_extensions()
+            .iter()
+            .map(|ext| {
+                let id = ext.bundle_identifier().unwrap_or("");
+                if !id
+                    .strip_prefix(main_app_bundle_id)
+                    .is_some_and(|suffix| suffix.starts_with('.') && suffix.len() > 1)
+                {
                     bail!(SideloadError::InvalidBundle(format!(
-                        "Extension {} is not part of the main app bundle identifier: {}",
+                        "Extension {} is not a dot-separated child of the main app bundle identifier: {}",
                         ext.bundle_name().unwrap_or("Unknown"),
                         id
                     )));
-                } else {
-                    ext.set_bundle_identifier(&format!(
-                        "{}{}",
-                        main_app_id_str,
-                        &id[main_app_bundle_id.len()..]
-                    ));
                 }
-            }
+                Ok(remap_identifier(id, main_app_bundle_id, main_app_id_str)
+                    .expect("validated extension prefix"))
+            })
+            .collect::<Result<Vec<_>, Report>>()?;
+
+        for (ext, id) in self
+            .bundle
+            .app_extensions_mut()
+            .iter_mut()
+            .zip(extension_ids)
+        {
+            ext.set_bundle_identifier(&id);
+            ext.remap_bundle_references(main_app_bundle_id, main_app_id_str);
         }
         self.bundle.set_bundle_identifier(main_app_id_str);
+        self.bundle
+            .remap_bundle_references(main_app_bundle_id, main_app_id_str);
 
         Ok(())
+    }
+
+    /// Apply the exact user-selected identifier, or retain the default team
+    /// suffix when there is no override. Registration and signing both read the
+    /// resulting bundle IDs, so profiles match the modified Info.plist files.
+    pub fn prepare_bundle_id(
+        &mut self,
+        team_id: &str,
+        bundle_id: Option<&str>,
+    ) -> Result<String, Report> {
+        let bundle_id = normalize_bundle_id(bundle_id)?;
+        if bundle_id.is_some() {
+            self.validate_custom_bundle_layout()?;
+        }
+        let original_id = self.main_bundle_id()?;
+        let final_id = bundle_id.unwrap_or_else(|| format!("{original_id}.{team_id}"));
+        self.update_bundle_id(&original_id, &final_id)?;
+        Ok(final_id)
+    }
+
+    fn validate_custom_bundle_layout(&self) -> Result<(), Report> {
+        // The existing signer registers the main app and its direct PlugIns.
+        // Do not leave embedded app IDs behind when a user requests a new ID.
+        // Keep the uncustomized path unchanged rather than expanding signing
+        // support for additional bundle layouts as part of this option.
+        let mut pending = vec![(&self.bundle, true)];
+        while let Some((bundle, is_main)) = pending.pop() {
+            if !is_main && !bundle.app_extensions().is_empty() {
+                bail!(SideloadError::InvalidBundle(
+                    "Custom bundle IDs are not supported for apps containing nested app extensions. Leave Bundle ID blank to use the standard installation behavior.".into(),
+                ));
+            }
+            for (directory, description) in
+                [("Watch", "embedded Watch apps"), ("AppClips", "App Clips")]
+            {
+                let entries = match isideload_vfs::fs::read_dir(bundle.bundle_dir.join(directory)) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(report!(error)
+                            .context("Failed to inspect embedded app bundles")
+                            .into());
+                    }
+                };
+                for entry in entries {
+                    let entry = entry.context("Failed to inspect embedded app bundle")?;
+                    if entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "app")
+                        && entry.file_type()?.is_dir()
+                    {
+                        bail!(SideloadError::InvalidBundle(format!(
+                            "Custom bundle IDs are not supported for apps containing {description}. Leave Bundle ID blank to use the standard installation behavior.",
+                        )));
+                    }
+                }
+            }
+            pending.extend(bundle.app_extensions().iter().map(|child| (child, false)));
+            pending.extend(bundle.frameworks().iter().map(|child| (child, false)));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bundles_to_register(&self, mode: &ExtensionsBehavior) -> Vec<&Bundle> {
+        let mut bundles = vec![&self.bundle];
+        if matches!(mode, ExtensionsBehavior::RegisterAll) {
+            bundles.extend(self.bundle.app_extensions());
+        }
+        bundles
     }
 
     pub async fn register_app_ids(
@@ -193,17 +280,7 @@ impl Application {
         dev_session: &mut DeveloperSession,
         team: &DeveloperTeam,
     ) -> Result<Vec<AppId>, Report> {
-        let mut bundles_with_app_id = vec![&self.bundle];
-
-        match mode {
-            ExtensionsBehavior::ReuseMain => {
-                // nothing to do
-            }
-            ExtensionsBehavior::RegisterAll => {
-                let extension_refs: Vec<_> = self.bundle.app_extensions().iter().collect();
-                bundles_with_app_id.extend(extension_refs);
-            }
-        }
+        let bundles_with_app_id = self.bundles_to_register(mode);
 
         let list_app_ids_response = dev_session
             .list_app_ids(team, None)

@@ -1,6 +1,7 @@
 pub mod application;
 pub mod builder;
 pub mod bundle;
+pub mod bundle_id;
 pub mod cert_identity;
 #[cfg(feature = "install")]
 pub mod install;

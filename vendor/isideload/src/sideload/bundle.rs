@@ -94,15 +94,17 @@ impl Bundle {
     }
 
     pub fn set_bundle_identifier(&mut self, id: &str) {
-        let old_id = self.bundle_identifier().and_then(|s| Some(s.to_string()));
+        let old_id = self.bundle_identifier().map(str::to_owned);
         if let Some(Value::Array(bg_tasks)) =
             self.app_info.get_mut("BGTaskSchedulerPermittedIdentifiers")
         {
             for task in bg_tasks.iter_mut() {
                 if let Value::String(task_id) = task {
                     if let Some(old_bundle_id) = &old_id {
-                        if task_id.contains(old_bundle_id) {
-                            *task_id = task_id.replace(old_bundle_id, id);
+                        if let Some(remapped) =
+                            super::bundle_id::remap_identifier(task_id, old_bundle_id, id)
+                        {
+                            *task_id = remapped;
                         }
                     }
                 }
@@ -113,6 +115,35 @@ impl Bundle {
             "CFBundleIdentifier".to_string(),
             Value::String(id.to_string()),
         );
+    }
+
+    /// Update only plist fields documented to contain bundle identifiers.
+    /// URL schemes, display strings and framework identities are not rewritten.
+    pub(crate) fn remap_bundle_references(&mut self, old_id: &str, new_id: &str) {
+        fn remap_field(info: &mut Dictionary, key: &str, old_id: &str, new_id: &str) {
+            if let Some(Value::String(value)) = info.get_mut(key)
+                && let Some(remapped) = super::bundle_id::remap_identifier(value, old_id, new_id)
+            {
+                *value = remapped;
+            }
+        }
+
+        remap_field(
+            &mut self.app_info,
+            "WKCompanionAppBundleIdentifier",
+            old_id,
+            new_id,
+        );
+        remap_field(&mut self.app_info, "WKAppBundleIdentifier", old_id, new_id);
+        if let Some(attributes) = self
+            .app_info
+            .get_mut("NSExtension")
+            .and_then(Value::as_dictionary_mut)
+            .and_then(|extension| extension.get_mut("NSExtensionAttributes"))
+            .and_then(Value::as_dictionary_mut)
+        {
+            remap_field(attributes, "WKAppBundleIdentifier", old_id, new_id);
+        }
     }
 
     pub fn bundle_identifier(&self) -> Option<&str> {

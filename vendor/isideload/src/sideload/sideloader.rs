@@ -10,6 +10,7 @@ use crate::{
         TeamSelection,
         application::{Application, SpecialApp},
         builder::{ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior},
+        bundle_id::normalize_bundle_id,
         cert_identity::CertificateIdentity,
         sign,
     },
@@ -84,10 +85,45 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
         F: Fn(f32) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.sign_app_with_bundle_id(
+            app_path,
+            team,
+            increased_memory_limit,
+            progress_callback,
+            pairing_file,
+            device_udid,
+            None,
+        )
+        .await
+    }
+
+    /// Sign with an optional exact main bundle ID for this operation only.
+    /// Blank or absent values preserve the default original-ID/team suffix.
+    pub async fn sign_app_with_bundle_id<F, Fut>(
+        &mut self,
+        app_path: PathBuf,
+        team: Option<DeveloperTeam>,
+        increased_memory_limit: bool,
+        progress_callback: Option<F>,
+        pairing_file: Option<&[u8]>,
+        device_udid: Option<&str>,
+        bundle_id: Option<&str>,
+    ) -> Result<(PathBuf, Option<SpecialApp>), Report>
+    where
+        F: Fn(f32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        // Reject invalid input before obtaining a team or certificate.
+        let bundle_id = normalize_bundle_id(bundle_id)?;
+        let mut app = Application::new(app_path)?;
+        let special = app.get_special_app();
         let team = match team {
             Some(t) => t,
             None => self.get_team().await?,
         };
+        let main_app_name = app.main_app_name()?;
+        let main_app_id_str = app.prepare_bundle_id(&team.team_id, bundle_id.as_deref())?;
+
         let cert_identity = CertificateIdentity::retrieve(
             &self.machine_name,
             &self.apple_email,
@@ -102,14 +138,6 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
         if let Some(callback) = &progress_callback {
             callback(0.1).await;
         }
-
-        let mut app = Application::new(app_path)?;
-        let special = app.get_special_app();
-
-        let main_bundle_id = app.main_bundle_id()?;
-        let main_app_name = app.main_app_name()?;
-        let main_app_id_str = format!("{}.{}", main_bundle_id, team.team_id);
-        app.update_bundle_id(&main_bundle_id, &main_app_id_str)?;
 
         let extensions_behavior = self
             .extensions_behavior
@@ -284,6 +312,35 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
         F: Fn(f32) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.install_app_with_bundle_id(
+            device_provider,
+            app_path,
+            increased_memory_limit,
+            progress_callback,
+            pairing_file,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "install")]
+    /// Sign and install using an optional exact main bundle ID. The override
+    /// belongs to this call and is never retained for later installations.
+    pub async fn install_app_with_bundle_id<F, Fut>(
+        &mut self,
+        device_provider: &impl IdeviceProvider,
+        app_path: PathBuf,
+        increased_memory_limit: bool,
+        progress_callback: Option<F>,
+        pairing_file: Option<&[u8]>,
+        bundle_id: Option<&str>,
+    ) -> Result<Option<SpecialApp>, Report>
+    where
+        F: Fn(f32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        // Validate before connecting to a device or registering it with Apple.
+        let bundle_id = normalize_bundle_id(bundle_id)?;
         let device_info = IdeviceInfo::from_device(device_provider).await?;
 
         let team = self.get_team().await?;
@@ -292,13 +349,14 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
             .await?;
 
         let (signed_app_path, special_app) = self
-            .sign_app(
+            .sign_app_with_bundle_id(
                 app_path,
                 Some(team),
                 increased_memory_limit,
                 progress_callback,
                 pairing_file,
                 Some(&device_info.udid),
+                bundle_id.as_deref(),
             )
             .await?;
 
