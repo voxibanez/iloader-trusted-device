@@ -47,6 +47,16 @@
     "ipa_files": "IPA Files",
     "logo_alt": "iloader logo"
   },
+  "install_options": {
+    "title": "Install IPA",
+    "selected_file": "Selected IPA",
+    "bundle_id": "Custom bundle ID (optional)",
+    "bundle_id_help": "Leave blank to use the default bundle ID. A custom ID is used exactly as entered, without an added team suffix.",
+    "invalid_bundle_id": "Use dot-separated letters, numbers, or hyphens, such as com.example.myapp. Spaces, underscores, and wildcards are not allowed.",
+    "bundle_id_note": "Use the same bundle ID and Apple Account when updating an installed app. A different ID installs a separate app and does not transfer existing app data.",
+    "install": "Install",
+    "open_failed": "Unable to open the IPA file picker"
+  },
   "apple_id": {
     "title": "Apple ID",
     "logged_in_as": "Logged in as",
