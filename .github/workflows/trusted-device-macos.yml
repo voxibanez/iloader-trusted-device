@@ -1,0 +1,85 @@
+name: Build trusted-device macOS app
+
+on:
+  push:
+    paths:
+      - ".github/workflows/trusted-device-macos.yml"
+      - "scripts/build-trusted-device-macos.sh"
+      - "src/**"
+      - "src-tauri/**"
+      - "vendor/**"
+      - "public/**"
+      - "package.json"
+      - "bun.lock"
+      - "index.html"
+      - "tsconfig*.json"
+      - "vite.config.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-device-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Apple Silicon app and DMG
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+          targets: aarch64-apple-darwin
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Cache Rust dependencies and build output
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: trusted-device-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml', 'vendor/isideload/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            trusted-device-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml', 'vendor/isideload/Cargo.toml') }}-
+            trusted-device-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Test, build, and verify the macOS app
+        run: bash scripts/build-trusted-device-macos.sh
+
+      - name: Upload macOS downloads
+        uses: actions/upload-artifact@v7
+        with:
+          name: iloader-trusted-device-macos-arm64
+          path: src-tauri/target/trusted-device-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Summarize build
+        run: |
+          {
+            echo '### macOS Apple Silicon build'
+            echo ''
+            echo 'The artifact contains the DMG, a ZIP preserving the app bundle, checksums, and build information.'
+            echo 'The app is ad-hoc signed and is not notarized. No Apple Account or signing secrets were used in CI.'
+            echo ''
+            echo '```text'
+            cat src-tauri/target/trusted-device-artifacts/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
