@@ -602,6 +602,8 @@ mod current_mac_tests {
                     Err(error) => panic!("metadata mock accept failed: {error}"),
                 }
             };
+            // macOS can preserve the listener's nonblocking mode on accept.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
