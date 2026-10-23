@@ -47,8 +47,9 @@ jobs:
         with:
           bun-version: "1.4.4"
 
-      - name: Cache Rust dependencies and build output
-        uses: actions/cache@v5
+      - name: Restore Rust dependencies and build output
+        id: rust_cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
@@ -83,3 +84,13 @@ jobs:
             cat src-tauri/target/trusted-device-artifacts/SHA256SUMS
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save Rust dependencies and build output
+        if: ${{ always() && !cancelled() && steps.rust_cache.outcome == 'success' && steps.rust_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ steps.rust_cache.outputs.cache-primary-key }}
