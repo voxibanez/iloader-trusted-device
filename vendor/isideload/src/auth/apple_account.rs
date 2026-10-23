@@ -34,6 +34,7 @@ pub struct AppleAccount {
     pub grandslam_client: Arc<GrandSlam>,
     pub trusted_phone_numbers: Option<Vec<TrustedNumber>>,
     login_state: LoginState,
+    last_login_status: LoginStatusSummary,
     debug: bool,
     last_error: Option<String>,
     err_429_retries: Option<u32>,
@@ -75,17 +76,124 @@ fn login_state_from_status(status: &Dictionary) -> Result<LoginState, Report> {
         match status_code.as_signed() {
             Some(200) => {}
             Some(409) => {
-                // A resumed challenge may have been created by the old SMS
-                // client. Explicitly request a device code instead of assuming
-                // the pending challenge used the trusted-device channel.
-                info!("Pending 2FA challenge; requesting trusted-device verification");
-                return Ok(LoginState::NeedsDevice2FA);
+                // With no explicit `au`, Apple has already pushed a device
+                // code. Requesting another challenge can invalidate that flow.
+                // An explicit secondaryAuth hint above still requests a device
+                // challenge, and never uses Apple's SMS endpoints.
+                info!("Trusted-device code already sent; waiting for verification");
+                return Ok(LoginState::NeedsDevice2FAVerification);
             }
             other => bail!("Unexpected Apple login status code {:?}", other),
         }
     }
 
     Ok(LoginState::LoggedIn)
+}
+
+fn status_integer(value: &plist::Value) -> Option<i64> {
+    match value {
+        plist::Value::Integer(number) => number.as_signed(),
+        // AltSign accepts both NSNumber and NSString for validateCode's ec.
+        plist::Value::String(number) => number.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Only these bounded, nonsecret status fields may appear in a login diagnostic.
+#[derive(Clone, Copy, Debug, Default)]
+struct LoginStatusSummary {
+    hsc: Option<i64>,
+    ec: Option<i64>,
+    au: Option<&'static str>,
+}
+
+impl LoginStatusSummary {
+    fn from_status(status: &Dictionary) -> Self {
+        Self {
+            hsc: status.get("hsc").and_then(status_integer),
+            ec: status.get("ec").and_then(status_integer),
+            au: status.get("au").map(|value| match value.as_string() {
+                Some("trustedDeviceSecondaryAuth") => "trustedDeviceSecondaryAuth",
+                Some("secondaryAuth") => "secondaryAuth",
+                Some("repair") => "repair",
+                Some(_) => "other",
+                None => "invalid",
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for LoginStatusSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let number = |value: Option<i64>| {
+            value.map_or_else(|| "absent".to_owned(), |number| number.to_string())
+        };
+        write!(
+            f,
+            "hsc={}, ec={}, au={}",
+            number(self.hsc),
+            number(self.ec),
+            self.au.unwrap_or("absent")
+        )
+    }
+}
+
+/// Read an explicit verification result, including the normal GrandSlam
+/// Response/Status envelopes. Missing or malformed ec must never mean success.
+fn trusted_device_verification_code(reply: &Dictionary) -> Result<i64, Report> {
+    let mut pending = vec![(reply, 0_u8)];
+    let mut error_codes = Vec::new();
+    let mut http_codes = Vec::new();
+
+    while let Some((status, depth)) = pending.pop() {
+        for (key, codes) in [("ec", &mut error_codes), ("hsc", &mut http_codes)] {
+            if let Some(value) = status.get(key) {
+                codes.push(status_integer(value).ok_or_else(|| {
+                    report!(
+                        "Trusted-device verification returned a malformed {} status",
+                        key
+                    )
+                })?);
+            }
+        }
+        for key in ["Response", "Status"] {
+            if let Some(value) = status.get(key) {
+                if depth >= 4 {
+                    bail!("Trusted-device verification returned excessive status nesting");
+                }
+                let nested = value.as_dictionary().ok_or_else(|| {
+                    report!(
+                        "Trusted-device verification returned a malformed {} envelope",
+                        key
+                    )
+                })?;
+                pending.push((nested, depth + 1));
+            }
+        }
+    }
+
+    if error_codes.is_empty() {
+        bail!(
+            "Trusted-device verification returned no explicit ec status; login remains unverified"
+        );
+    }
+    let mut failures = error_codes.iter().copied().filter(|code| *code != 0);
+    if let Some(code) = failures.next() {
+        if failures.any(|other| other != code) {
+            bail!("Trusted-device verification returned conflicting ec error statuses");
+        }
+        return Ok(code);
+    }
+    if let Some(code) = http_codes
+        .into_iter()
+        .find(|code| !(200..300).contains(code))
+    {
+        bail!(
+            "Trusted-device verification returned ec=0 but hsc={}; login remains unverified",
+            code
+        );
+    }
+    Ok(0)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,24 +218,33 @@ fn trusted_device_action(
 }
 
 /// Bound repeated challenges separately from the existing login-transition
-/// budget. An accepted code must finish login, not start another challenge loop.
+/// budget. After an explicit ec=0, permit one SRP retry to complete sign-in.
 #[derive(Default)]
 struct TrustedDeviceProgress {
     requests: u8,
-    accepted_code: bool,
+    verification_returned_success: bool,
+    initial_login_status: LoginStatusSummary,
 }
 
 impl TrustedDeviceProgress {
-    fn check_state(&self, state: &LoginState) -> Result<(), Report> {
-        if self.accepted_code
+    fn check_state(
+        &self,
+        state: &LoginState,
+        current_status: &LoginStatusSummary,
+    ) -> Result<(), Report> {
+        if self.verification_returned_success
             && matches!(
                 state,
                 LoginState::NeedsDevice2FA | LoginState::NeedsDevice2FAVerification
             )
         {
             bail!(
-                "Apple accepted the trusted-device code but requested verification again. \
-                 Login stopped; SMS authentication remains disabled."
+                "The trusted-device verification endpoint returned ec=0, but the next \
+                 Apple sign-in still requires verification. Login stopped after one \
+                 verification and sign-in retry; SMS remains disabled. \
+                 Initial status: [{}]. Retry status: [{}].",
+                self.initial_login_status,
+                current_status
             );
         }
         Ok(())
@@ -146,7 +263,7 @@ impl TrustedDeviceProgress {
 
     fn verified(&mut self, state: &LoginState) {
         if matches!(state, LoginState::NeedsLogin) {
-            self.accepted_code = true;
+            self.verification_returned_success = true;
         }
     }
 }
@@ -243,6 +360,7 @@ impl AppleAccount {
             grandslam_client: Arc::new(grandslam_client),
             debug,
             login_state: LoginState::NeedsLogin,
+            last_login_status: LoginStatusSummary::default(),
             trusted_phone_numbers: None,
             last_error: None,
             err_429_retries,
@@ -278,8 +396,22 @@ impl AppleAccount {
 
         debug!("Initial login successful");
 
+        self.complete_login(password, two_factor_callback).await
+    }
+
+    async fn complete_login<C>(
+        &mut self,
+        password: &str,
+        two_factor_callback: C,
+    ) -> Result<(), Report>
+    where
+        C: TwoFactorCallback,
+    {
         let mut attempts = 0;
-        let mut progress = TrustedDeviceProgress::default();
+        let mut progress = TrustedDeviceProgress {
+            initial_login_status: self.last_login_status,
+            ..Default::default()
+        };
 
         loop {
             attempts += 1;
@@ -290,7 +422,7 @@ impl AppleAccount {
                 );
             }
             self.login_state = trusted_device_only_state(self.login_state.clone());
-            progress.check_state(&self.login_state)?;
+            progress.check_state(&self.login_state, &self.last_login_status)?;
             match self.login_state.clone() {
                 LoginState::LoggedIn => {
                     info!("Successfully logged in to Apple ID");
@@ -432,33 +564,20 @@ impl AppleAccount {
             .context("Failed to read trusted device 2FA response text")?;
 
         let plist: Dictionary = plist::from_bytes(res.as_bytes())
-            .context("Failed to parse trusted device response plist")
-            .attach_with(|| res.clone())?;
-        let res = plist
-            .check_grandslam_error()
-            .context("Trusted device 2FA rejected");
-        if let Err(ref report) = res {
-            for cause in report.iter_reports() {
-                if let Some(err) = cause.downcast_current_context::<SideloadError>() {
-                    match err {
-                        &SideloadError::AuthWithMessage(code, ref message) => match code {
-                            // Incorrect Verification Code, let the user try again
-                            -21669 => {
-                                warn!("{} - {}", code, message);
-                                self.last_error = format!("{} - {}", code, message).into();
-
-                                return Ok(LoginState::NeedsDevice2FAVerification);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                }
+            .context("Failed to parse trusted device response plist")?;
+        match trusted_device_verification_code(&plist)? {
+            0 => {}
+            -21669 => {
+                self.last_error = Some("Incorrect verification code (-21669). Try again.".into());
+                return Ok(LoginState::NeedsDevice2FAVerification);
             }
+            code => bail!(SideloadError::AuthWithMessage(
+                code,
+                "Trusted-device verification rejected; login remains unverified".into(),
+            )),
         }
-        res?;
 
-        debug!("Trusted device 2FA completed, need to login again");
+        debug!("Trusted device verification returned ec=0; retrying sign-in");
 
         Ok(LoginState::NeedsLogin)
     }
@@ -501,7 +620,7 @@ impl AppleAccount {
         let gs_service_url = self.grandslam_client.get_url("gsService")?;
         debug!("GrandSlam service URL: {}", gs_service_url);
 
-        let cpd = anisette_data.get_client_provided_data();
+        let mut cpd = anisette_data.get_client_provided_data();
 
         let srp_client = srp::Client::<G2048, Sha256>::new_with_options(false);
         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
@@ -518,9 +637,11 @@ impl AppleAccount {
                 .resync(&sim)
                 .await
                 .context("Anisette resync failed")?;
-            let fresh_cpd = fresh_anisette.get_client_provided_data();
+            // Both SRP steps must use the corrected anisette data. Keeping the
+            // old CPD for `complete` would undo the server-requested resync.
+            cpd = fresh_anisette.get_client_provided_data();
             raw_response = self
-                .send_init_request(&gs_service_url, &fresh_cpd, &a_pub)
+                .send_init_request(&gs_service_url, &cpd, &a_pub)
                 .await
                 .context("Failed to send resynced init request")?;
         }
@@ -630,6 +751,7 @@ impl AppleAccount {
 
         debug!("Login step 2 completed");
 
+        self.last_login_status = LoginStatusSummary::from_status(status);
         login_state_from_status(status)
     }
 
@@ -889,9 +1011,16 @@ mod trusted_device_tests {
     }
 
     #[test]
-    fn pending_challenge_does_not_reuse_an_old_sms_code() {
+    fn pending_challenge_without_auth_hint_waits_for_the_already_pushed_code() {
         let mut status = Dictionary::new();
         status.insert("hsc".into(), plist::Value::Integer(409.into()));
+        assert_eq!(
+            login_state_from_status(&status).unwrap(),
+            LoginState::NeedsDevice2FAVerification
+        );
+
+        // Explicit SMS routing is different from the no-au auto-push response.
+        status.insert("au".into(), plist::Value::String("secondaryAuth".into()));
         assert_eq!(
             login_state_from_status(&status).unwrap(),
             LoginState::NeedsDevice2FA
@@ -946,30 +1075,63 @@ mod trusted_device_tests {
     }
 
     #[test]
-    fn accepted_code_cannot_start_an_automatic_challenge_loop() {
-        let mut progress = TrustedDeviceProgress::default();
+    fn successful_verification_allows_one_login_retry_without_another_challenge_loop() {
+        let initial = LoginStatusSummary::from_status(&plist!(dict {
+            "hsc": 409_i64,
+            "ec": 0_i64,
+        }));
+        let retry = LoginStatusSummary::from_status(&plist!(dict {
+            "hsc": 409_i64,
+            "ec": 0_i64,
+            "au": "secondaryAuth",
+        }));
+        let mut progress = TrustedDeviceProgress {
+            initial_login_status: initial,
+            ..Default::default()
+        };
         progress.verified(&LoginState::NeedsDevice2FAVerification);
         assert!(
             progress
-                .check_state(&LoginState::NeedsDevice2FAVerification)
+                .check_state(&LoginState::NeedsDevice2FAVerification, &initial)
                 .is_ok()
         );
 
         progress.verified(&LoginState::NeedsLogin);
-        assert!(progress.check_state(&LoginState::NeedsLogin).is_ok());
-        assert!(progress.check_state(&LoginState::LoggedIn).is_ok());
+        assert!(
+            progress
+                .check_state(&LoginState::NeedsLogin, &initial)
+                .is_ok()
+        );
+        assert!(progress.check_state(&LoginState::LoggedIn, &retry).is_ok());
         for state in [
             LoginState::NeedsDevice2FA,
             LoginState::NeedsDevice2FAVerification,
             LoginState::NeedsSMS2FA(1),
             LoginState::NeedsSMS2FAVerification(1),
         ] {
-            assert!(
-                progress
-                    .check_state(&trusted_device_only_state(state))
-                    .is_err()
-            );
+            let error = progress
+                .check_state(&trusted_device_only_state(state), &retry)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("verification endpoint returned ec=0"));
+            assert!(error.contains("Initial status: [hsc=409, ec=0, au=absent]"));
+            assert!(error.contains("Retry status: [hsc=409, ec=0, au=secondaryAuth]"));
+            assert!(!error.contains("Apple accepted"));
         }
+    }
+
+    #[test]
+    fn login_status_diagnostic_excludes_unrecognized_values_and_other_fields() {
+        let summary = LoginStatusSummary::from_status(&plist!(dict {
+            "hsc": "private-status-value",
+            "ec": "0",
+            "au": "private-auth-method",
+            "em": "private-message",
+            "GsIdmsToken": "private-token",
+        }))
+        .to_string();
+        assert_eq!(summary, "hsc=absent, ec=0, au=other");
+        assert!(!summary.contains("private"));
     }
 
     #[test]
