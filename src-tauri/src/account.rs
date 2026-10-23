@@ -15,6 +15,7 @@ use isideload::{
     util::callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
 };
 use keyring::Entry;
+use rootcause::option_ext::OptionExt;
 use rootcause::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
