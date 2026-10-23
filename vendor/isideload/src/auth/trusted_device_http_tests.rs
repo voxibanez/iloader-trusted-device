@@ -7,7 +7,7 @@ use std::{
     net::TcpListener,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -122,6 +122,7 @@ impl MockServer {
             grandslam_client: Arc::new(GrandSlam::for_auth_test(urls)),
             trusted_phone_numbers: None,
             login_state: LoginState::NeedsDevice2FA,
+            last_login_status: LoginStatusSummary::default(),
             debug: false,
             last_error: None,
             err_429_retries: None,
@@ -145,16 +146,16 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-fn verification_reply(error_code: i64) -> String {
+fn reply_xml(reply: &Dictionary) -> String {
     let mut bytes = Vec::new();
-    plist::to_writer_xml(
-        &mut bytes,
-        &plist!(dict {
-            "Status": { "ec": error_code, "em": "test verification status" }
-        }),
-    )
-    .unwrap();
+    plist::to_writer_xml(&mut bytes, reply).unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+fn verification_reply(error_code: i64) -> String {
+    reply_xml(&plist!(dict {
+        "Status": { "ec": error_code, "em": "test verification status" }
+    }))
 }
 
 #[test]
@@ -227,5 +228,123 @@ fn rejected_device_code_remains_unverified() {
             request_line: "GET /validate-code HTTP/1.1".into(),
             security_code: Some("000000".into())
         },]
+    );
+}
+
+#[test]
+fn explicit_verification_success_supports_integer_string_and_grandslam_envelopes() {
+    // AltSign reads the top-level ec as NSNumber or NSString. GrandSlam-style
+    // replies may instead carry it in Status or Response/Status.
+    let replies = [
+        plist!(dict { "ec": 0_i64 }),
+        plist!(dict { "ec": "0" }),
+        plist!(dict { "Status": { "ec": 0_i64 } }),
+        plist!(dict { "Response": { "ec": "0" } }),
+        plist!(dict { "Response": { "Status": { "ec": 0_i64, "hsc": 200_i64 } } }),
+    ];
+    for reply in replies {
+        let server = MockServer::new(vec![(200, reply_xml(&reply))]);
+        runtime().block_on(async {
+            let mut account = server.account();
+            assert_eq!(
+                account
+                    .verify_trusted_device_2fa("123456".into())
+                    .await
+                    .unwrap(),
+                LoginState::NeedsLogin
+            );
+            assert!(account.last_error.is_none());
+        });
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn nested_and_string_error_codes_never_become_verification_success() {
+    let replies = [
+        plist!(dict { "ec": "-21669" }),
+        plist!(dict { "Response": { "Status": { "ec": -21669_i64 } } }),
+        // A superficial success must not hide an error in the response body.
+        plist!(dict { "ec": 0_i64, "Response": { "Status": { "ec": "-21669" } } }),
+    ];
+    for reply in replies {
+        let server = MockServer::new(vec![(200, reply_xml(&reply))]);
+        runtime().block_on(async {
+            let mut account = server.account();
+            assert_eq!(
+                account
+                    .verify_trusted_device_2fa("000000".into())
+                    .await
+                    .unwrap(),
+                LoginState::NeedsDevice2FAVerification
+            );
+            assert!(account.last_error.as_ref().unwrap().contains("-21669"));
+        });
+    }
+}
+
+#[test]
+fn malformed_or_missing_verification_status_fails_closed_without_response_secrets() {
+    let replies = [
+        Dictionary::new(),
+        plist!(dict { "hsc": 200_i64 }),
+        plist!(dict { "ec": false }),
+        plist!(dict { "ec": "not-a-number" }),
+        plist!(dict { "ec": 0_i64, "Status": "private-envelope" }),
+        plist!(dict { "Response": { "Status": { "em": "private-message" } } }),
+        plist!(dict { "ec": 0_i64, "Response": { "Status": { "ec": false } } }),
+        plist!(dict { "ec": 0_i64, "Status": { "hsc": 403_i64 } }),
+        plist!(dict { "ec": -21669_i64, "Status": { "ec": -12345_i64 } }),
+    ];
+    for reply in replies {
+        let server = MockServer::new(vec![(200, reply_xml(&reply))]);
+        runtime().block_on(async {
+            let mut account = server.account();
+            let error = account
+                .verify_trusted_device_2fa("000000".into())
+                .await
+                .expect_err("an explicit successful verification status is required");
+            assert!(account.last_error.is_none());
+            assert!(!format!("{error:?}").contains("private"));
+        });
+    }
+}
+
+#[test]
+fn an_auto_pushed_code_is_validated_without_requesting_another_challenge() {
+    let server = MockServer::new(vec![(200, verification_reply(-21669))]);
+    let callbacks = AtomicUsize::new(0);
+    runtime().block_on(async {
+        let mut account = server.account();
+        let status = plist!(dict { "hsc": 409_i64, "ec": 0_i64 });
+        account.login_state = login_state_from_status(&status).unwrap();
+        account.last_login_status = LoginStatusSummary::from_status(&status);
+        let error = account
+            .complete_login("unused-test-password", |params: TwoFactorCallbackParams| {
+                assert!(!params.sms);
+                assert!(!params.unknown);
+                assert!(params.numbers.is_empty());
+                assert!(params.selected_number_id.is_none());
+                let response = match callbacks.fetch_add(1, Ordering::Relaxed) {
+                    0 => TwoFactorCallbackResponse::SubmitCode("000000".into()),
+                    1 => {
+                        assert!(params.last_error.as_ref().unwrap().contains("-21669"));
+                        TwoFactorCallbackResponse::Abort
+                    }
+                    _ => panic!("unexpected repeated verification callback"),
+                };
+                async move { Ok(response) }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authentication canceled"));
+    });
+    assert_eq!(callbacks.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        *server.requests.lock().unwrap(),
+        vec![RecordedRequest {
+            request_line: "GET /validate-code HTTP/1.1".into(),
+            security_code: Some("000000".into()),
+        }]
     );
 }
