@@ -57,6 +57,18 @@ Use the same bundle ID and Apple Account when updating an existing installation.
 
 Version 2.4.1 retains the trusted-device authentication implementation from the tested 2.4.0 fork and uses the same app identifier and credential storage.
 
+## Remove app extensions (v2.4.2)
+
+1. Click **Import IPA** and choose the IPA file.
+2. In **Install IPA**, enable **Remove all app extensions**.
+3. Optionally enter a custom bundle ID, then click **Install**.
+
+The option is off by default and resets for each IPA. When enabled, all `.appex` directories are removed recursively from the extracted installation copy before bundle IDs are changed, App IDs are registered, or the app is signed. The original IPA is unchanged. The signing model is constructed from the prepared files so removed extensions cannot remain in it.
+
+Widgets, share extensions, notification extensions, and other features supplied by those extensions will be unavailable. Some apps require an extension for core functionality. The main app, frameworks, resources, embedded Watch apps, and App Clips are retained; the option removes their `.appex` extensions, not the embedded apps themselves. Existing custom-ID restrictions for retained unsupported embedded apps still apply.
+
+This is an installation compatibility option. It does not reset Apple account limits or change developer-team selection or provisioning mode. An unchecked installation uses the existing behavior, including keeping extensions. The trusted-device authentication, disabled SMS route, custom bundle-ID option, app identity, and credential storage are unchanged.
+
 ## Build on an Apple Silicon Mac
 
 Prerequisites: Xcode Command Line Tools, [Rust/rustup](https://rustup.rs/), and [Bun](https://bun.sh/). The GitHub workflow pins Rust **1.99.1** and Bun **1.4.4**. The local script uses the versions installed on your Mac and records them in `build-info.txt`.
@@ -67,7 +79,7 @@ From the repository directory:
 bash scripts/build-trusted-device-macos.sh
 ```
 
-The script installs locked frontend dependencies, runs the vendored library's authentication and bundle-ID tests, builds the native app and DMG with locked Rust dependencies, verifies the app, and writes downloads to:
+The script installs locked frontend dependencies, runs the vendored library's authentication, bundle-ID, and extension-removal tests, builds the native app and DMG with locked Rust dependencies, verifies the app, and writes downloads to:
 
 ```text
 src-tauri/target/trusted-device-artifacts/
