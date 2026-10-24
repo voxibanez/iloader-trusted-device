@@ -5,7 +5,7 @@ import { Modal } from "./Modal";
 type InstallOptionsDialogProps = {
   appPath: string;
   onCancel: () => void;
-  onInstall: (bundleId: string | null) => void;
+  onInstall: (bundleId: string | null, removeExtensions: boolean) => void;
 };
 
 export function InstallOptionsDialog({
@@ -15,6 +15,7 @@ export function InstallOptionsDialog({
 }: InstallOptionsDialogProps) {
   const { t } = useTranslation();
   const [bundleId, setBundleId] = useState("");
+  const [removeExtensions, setRemoveExtensions] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const submittedRef = useRef(false);
   const normalizedBundleId = bundleId.trim();
@@ -68,7 +69,7 @@ export function InstallOptionsDialog({
             event.preventDefault();
             if (!validBundleId || submittedRef.current) return;
             submittedRef.current = true;
-            onInstall(normalizedBundleId || null);
+            onInstall(normalizedBundleId || null, removeExtensions);
           }}
         >
           <label htmlFor="install-bundle-id">
@@ -108,6 +109,25 @@ export function InstallOptionsDialog({
           <p className="install-options-note">
             {t("install_options.bundle_id_note")}
           </p>
+          <div className="install-extension-option">
+            <label htmlFor="install-remove-extensions">
+              <input
+                id="install-remove-extensions"
+                name="removeExtensions"
+                type="checkbox"
+                checked={removeExtensions}
+                aria-describedby="install-remove-extensions-help"
+                onChange={(event) => setRemoveExtensions(event.target.checked)}
+              />
+              <span>{t("install_options.remove_extensions")}</span>
+            </label>
+            <p
+              id="install-remove-extensions-help"
+              className="install-options-help"
+            >
+              {t("install_options.remove_extensions_help")}
+            </p>
+          </div>
           <div className="install-options-actions">
             <button type="button" onClick={onCancel}>
               {t("common.cancel")}
