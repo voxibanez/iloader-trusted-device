@@ -9,6 +9,7 @@ use crate::sideload::builder::ExtensionsBehavior;
 use crate::sideload::bundle::Bundle;
 use crate::sideload::bundle_id::{normalize_bundle_id, remap_identifier};
 use crate::sideload::cert_identity::CertificateIdentity;
+use crate::sideload::extensions::{remove_app_extensions, validate_removal_source};
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, Generate, KeyInit},
@@ -30,8 +31,33 @@ pub struct Application {
     //pub temp_path: PathBuf,
 }
 
+// Only opt-in removals use a new extraction. Clean up that working copy if
+// preparation fails before it can be handed to the signer.
+#[derive(Default)]
+struct RemovalExtractionCleanup(Option<PathBuf>);
+
+impl Drop for RemovalExtractionCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = isideload_vfs::fs::remove_dir_all(path);
+        }
+    }
+}
+
 impl Application {
     pub fn new(path: PathBuf) -> Result<Self, Report> {
+        Self::new_with_extension_removal(path, false)
+    }
+
+    /// Load each operation independently. Removal happens before constructing
+    /// the bundle model, so no deleted extensions or dylibs remain in memory.
+    pub(crate) fn new_with_extension_removal(
+        path: PathBuf,
+        remove_extensions: bool,
+    ) -> Result<Self, Report> {
+        if remove_extensions {
+            validate_removal_source(&path)?;
+        }
         if !isideload_vfs::fs::metadata(&path).is_ok() {
             bail!(SideloadError::InvalidBundle(
                 "Application path does not exist".to_string(),
@@ -39,23 +65,36 @@ impl Application {
         }
 
         let mut bundle_path = path.clone();
+        let mut removal_extraction = RemovalExtractionCleanup::default();
         //let mut temp_path = PathBuf::new();
 
         if isideload_vfs::fs::metadata(&bundle_path)?.is_file() {
             let temp_dir = isideload_vfs::fs::temp_dir();
-            let temp_path = temp_dir.join(
-                path.file_name()
-                    .ok_or_report()?
-                    .to_string_lossy()
-                    .to_string()
-                    + "_extracted",
-            );
-            if isideload_vfs::fs::metadata(&temp_path).is_ok() {
-                isideload_vfs::fs::remove_dir_all(&temp_path)
-                    .context("Failed to remove existing temporary directory")?;
-            }
-            isideload_vfs::fs::create_dir_all(&temp_path)
-                .context("Failed to create temporary directory")?;
+            let temp_path = if remove_extensions {
+                // A fresh, operation-owned directory avoids deleting or
+                // reusing any earlier extraction or a source app directory.
+                let temp_path =
+                    temp_dir.join(format!("isideload-{}-extracted", uuid::Uuid::new_v4()));
+                isideload_vfs::fs::create_dir(&temp_path)
+                    .context("Failed to create temporary directory")?;
+                removal_extraction.0 = Some(temp_path.clone());
+                temp_path
+            } else {
+                let temp_path = temp_dir.join(
+                    path.file_name()
+                        .ok_or_report()?
+                        .to_string_lossy()
+                        .to_string()
+                        + "_extracted",
+                );
+                if isideload_vfs::fs::metadata(&temp_path).is_ok() {
+                    isideload_vfs::fs::remove_dir_all(&temp_path)
+                        .context("Failed to remove existing temporary directory")?;
+                }
+                isideload_vfs::fs::create_dir_all(&temp_path)
+                    .context("Failed to create temporary directory")?;
+                temp_path
+            };
 
             let file = File::open(&path).context("Failed to open application archive")?;
             let mut archive =
@@ -66,11 +105,26 @@ impl Application {
                 .context("Failed to extract application archive")?;
 
             let payload_folder = temp_path.join("Payload");
+            if remove_extensions
+                && isideload_vfs::fs::symlink_metadata(&payload_folder)
+                    .is_ok_and(|metadata| metadata.is_symlink())
+            {
+                bail!(SideloadError::InvalidBundle(
+                    "Cannot safely remove app extensions from an IPA whose Payload directory is a symbolic link.".into(),
+                ));
+            }
             if isideload_vfs::fs::metadata(&payload_folder).is_ok() && payload_folder.is_dir() {
                 let app_dirs: Vec<_> = isideload_vfs::fs::read_dir(&payload_folder)
                     .context("Failed to read Payload directory")?
                     .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                    .filter(|entry| {
+                        if remove_extensions {
+                            isideload_vfs::fs::symlink_metadata(entry.path())
+                                .is_ok_and(|metadata| !metadata.is_symlink() && metadata.is_dir())
+                        } else {
+                            entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                        }
+                    })
                     .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "app"))
                     .collect();
                 if app_dirs.len() == 1 {
@@ -103,7 +157,17 @@ impl Application {
                 ),));
             }
         }
+        if remove_extensions {
+            let removed = remove_app_extensions(&bundle_path)?;
+            info!(
+                "Removed {} app extensions from the installation copy",
+                removed
+            );
+        }
+        // Construct a fresh model after removal; this also rebuilds recursive
+        // framework and library lists from the remaining files.
         let bundle = Bundle::new(bundle_path)?;
+        removal_extraction.0 = None;
 
         Ok(Application {
             bundle, /*temp_path*/

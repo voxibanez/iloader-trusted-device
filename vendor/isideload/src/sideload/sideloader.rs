@@ -12,6 +12,7 @@ use crate::{
         builder::{ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior},
         bundle_id::normalize_bundle_id,
         cert_identity::CertificateIdentity,
+        extensions::validate_removal_source,
         sign,
     },
     util::{
@@ -28,6 +29,14 @@ use idevice::provider::IdeviceProvider;
 use plist::Dictionary;
 use rootcause::{option_ext::OptionExt, prelude::*};
 use tracing::info;
+
+/// Options for one signing or installation call. Neither option is retained
+/// on the sideloader or applied to a subsequent app.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SideloadOptions<'a> {
+    pub bundle_id: Option<&'a str>,
+    pub remove_extensions: bool,
+}
 
 pub struct Sideloader<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> {
     team_selection: TeamSelection,
@@ -113,9 +122,41 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
         F: Fn(f32) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.sign_app_with_options(
+            app_path,
+            team,
+            increased_memory_limit,
+            progress_callback,
+            pairing_file,
+            device_udid,
+            SideloadOptions {
+                bundle_id,
+                ..SideloadOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Sign using per-operation options. Extension removal affects only a
+    /// freshly extracted IPA and runs before bundle-ID layout checks,
+    /// remapping, and signing.
+    pub async fn sign_app_with_options<F, Fut>(
+        &mut self,
+        app_path: PathBuf,
+        team: Option<DeveloperTeam>,
+        increased_memory_limit: bool,
+        progress_callback: Option<F>,
+        pairing_file: Option<&[u8]>,
+        device_udid: Option<&str>,
+        options: SideloadOptions<'_>,
+    ) -> Result<(PathBuf, Option<SpecialApp>), Report>
+    where
+        F: Fn(f32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         // Reject invalid input before obtaining a team or certificate.
-        let bundle_id = normalize_bundle_id(bundle_id)?;
-        let mut app = Application::new(app_path)?;
+        let bundle_id = normalize_bundle_id(options.bundle_id)?;
+        let mut app = Application::new_with_extension_removal(app_path, options.remove_extensions)?;
         let special = app.get_special_app();
         let team = match team {
             Some(t) => t,
@@ -339,8 +380,40 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
         F: Fn(f32) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.install_app_with_options(
+            device_provider,
+            app_path,
+            increased_memory_limit,
+            progress_callback,
+            pairing_file,
+            SideloadOptions {
+                bundle_id,
+                ..SideloadOptions::default()
+            },
+        )
+        .await
+    }
+
+    #[cfg(feature = "install")]
+    /// Sign and install with options scoped to this operation only.
+    pub async fn install_app_with_options<F, Fut>(
+        &mut self,
+        device_provider: &impl IdeviceProvider,
+        app_path: PathBuf,
+        increased_memory_limit: bool,
+        progress_callback: Option<F>,
+        pairing_file: Option<&[u8]>,
+        options: SideloadOptions<'_>,
+    ) -> Result<Option<SpecialApp>, Report>
+    where
+        F: Fn(f32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         // Validate before connecting to a device or registering it with Apple.
-        let bundle_id = normalize_bundle_id(bundle_id)?;
+        let bundle_id = normalize_bundle_id(options.bundle_id)?;
+        if options.remove_extensions {
+            validate_removal_source(&app_path)?;
+        }
         let device_info = IdeviceInfo::from_device(device_provider).await?;
 
         let team = self.get_team().await?;
@@ -349,14 +422,17 @@ impl<C: MaxCertsCallback, E: ExtensionsBehaviorCallback> Sideloader<C, E> {
             .await?;
 
         let (signed_app_path, special_app) = self
-            .sign_app_with_bundle_id(
+            .sign_app_with_options(
                 app_path,
                 Some(team),
                 increased_memory_limit,
                 progress_callback,
                 pairing_file,
                 Some(&device_info.udid),
-                bundle_id.as_deref(),
+                SideloadOptions {
+                    bundle_id: bundle_id.as_deref(),
+                    remove_extensions: options.remove_extensions,
+                },
             )
             .await?;
 
