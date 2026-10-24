@@ -443,11 +443,15 @@ function App() {
         <InstallOptionsDialog
           appPath={pendingIpaPath}
           onCancel={() => setPendingIpaPath(null)}
-          onInstall={(bundleId) => {
+          onInstall={(bundleId, removeExtensions) => {
             const appPath = pendingIpaPath;
             setPendingIpaPath(null);
             if (!ensuredLoggedIn() || !ensureSelectedDevice()) return;
-            startOperation(sideloadOperation, { appPath, bundleId }).catch((e) => {
+            startOperation(sideloadOperation, {
+              appPath,
+              bundleId,
+              removeExtensions,
+            }).catch((e) => {
               console.log(e.type);
               console.error(e.message);
             });

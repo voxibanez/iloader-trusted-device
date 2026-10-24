@@ -427,6 +427,31 @@ h4 {
   color: #c4c4cc;
 }
 
+.install-extension-option {
+  margin: 1.25rem 0;
+}
+
+.install-extension-option label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  cursor: pointer;
+}
+
+.install-extension-option input[type="checkbox"] {
+  flex: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0.2rem 0 0;
+  padding: 0;
+  accent-color: var(--accent-primary);
+}
+
+.install-extension-option input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 3px;
+}
+
 .install-options-actions {
   display: flex;
   justify-content: flex-end;
