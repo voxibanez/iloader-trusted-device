@@ -7,7 +7,10 @@ use crate::{
     pairing::{get_sidestore_info, place_file},
 };
 use isideload::{
-    sideload::{application::SpecialApp, bundle_id::normalize_bundle_id, sideloader::Sideloader},
+    sideload::{
+        SideloadOptions, application::SpecialApp, bundle_id::normalize_bundle_id,
+        sideloader::Sideloader,
+    },
     util::callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
 };
 use tauri::{AppHandle, Manager, State, Window};
@@ -51,6 +54,7 @@ pub async fn sideload(
     sideloader_state: State<'_, SideloaderMutex>,
     app_path: String,
     bundle_id: Option<String>,
+    remove_extensions: bool,
 ) -> Result<Option<SpecialApp>, AppError> {
     let bundle_id = normalize_bundle_id(bundle_id.as_deref())?;
     let device = {
@@ -67,13 +71,16 @@ pub async fn sideload(
 
     let special = sideloader
         .get_mut()
-        .install_app_with_bundle_id(
+        .install_app_with_options(
             &provider,
             app_path.into(),
             false,
             None::<fn(f32) -> std::future::Ready<()>>,
             Some(&device.pairing),
-            bundle_id.as_deref(),
+            SideloadOptions {
+                bundle_id: bundle_id.as_deref(),
+                remove_extensions,
+            },
         )
         .await?;
 
@@ -87,12 +94,20 @@ pub async fn sideload_operation(
     sideloader_state: State<'_, SideloaderMutex>,
     app_path: String,
     bundle_id: Option<String>,
+    remove_extensions: Option<bool>,
 ) -> Result<(), AppError> {
     let op = Operation::new("sideload".to_string(), &window);
     op.start("install")?;
     op.fail_if_err(
         "install",
-        sideload(device_state, sideloader_state, app_path, bundle_id).await,
+        sideload(
+            device_state,
+            sideloader_state,
+            app_path,
+            bundle_id,
+            remove_extensions.unwrap_or(false),
+        )
+        .await,
     )?;
     op.complete("install")?;
     Ok(())
@@ -155,6 +170,7 @@ pub async fn install_sidestore_operation(
             sideloader_state,
             dest.to_string_lossy().to_string(),
             None,
+            false,
         )
         .await,
     )?;
